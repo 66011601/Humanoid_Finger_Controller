@@ -10,7 +10,8 @@ Adafruit_PWMServoDriver pwm = Adafruit_PWMServoDriver(0x40);
 #define HX711_DT  3
 #define HX711_SCK 2
 HX711 scale;
-float threshold = 500000.0;   // adjust threshold as needed
+float upper_threshold = 500000.0;   // adjust threshold as needed
+float lower_threshold = 0.0;
 
 // ---- SPI ----
 volatile byte spiBuffer[12];
@@ -78,7 +79,8 @@ void loop() {
     // --- Safety check from HX711 ---
     long val = scale.read_average(5);
     Serial.println(val);
-    if (val > threshold) {
+    if (val > upper_threshold && val < lower_threshold) // Adjust as need
+    {
       status = 0x12; // Halt
       Serial.println("Sensor triggered! HALT.");
       sendFeedback();
@@ -126,3 +128,4 @@ void sendFeedback() {
   }
   Serial.println();
 }
+
