@@ -10,7 +10,7 @@ Adafruit_PWMServoDriver pwm = Adafruit_PWMServoDriver(0x40);
 #define HX711_DT  3
 #define HX711_SCK 2
 HX711 scale;
-float threshold = 500.0;   // adjust threshold as needed
+float threshold = 500000.0;   // adjust threshold as needed
 
 // ---- SPI ----
 volatile byte spiBuffer[12];
@@ -24,6 +24,7 @@ volatile bool commandReceived = false;
 int servoMin = 150;       // Calibrate your servo min pulse
 int servoMax = 600;       // Calibrate your servo max pulse
 float angleFinger[6];
+byte feedback[14];
 
 // ---- Status codes ----
 byte status = 0x00; // 0x00 idle, 0x01 moving, 0x02 done, 0x12 halt
@@ -47,11 +48,18 @@ void setup() {
 
 ISR(SPI_STC_vect) {
   static int index = 0;
+  static int replyIndex = 1;
   byte c = SPDR;        // read received byte
   spiBuffer[index++] = c;
-  if (index >= 12) {    // got full packet (6 DOFs × 2 bytes)
+  if (index >= 14) {    // got full packet (6 DOFs × 2 bytes)
     commandReceived = true;
     index = 0;
+  }
+
+  SPDR = feedback[replyIndex];      
+  replyIndex++;                     
+  if (replyIndex >= 14) {            
+    replyIndex = 0;
   }
 }
 
@@ -103,7 +111,6 @@ void loop() {
 }
 
 void sendFeedback() {
-  byte feedback[14];
   // Echo 12 bytes
   for (int i = 0; i < 12; i++) feedback[i] = spiBuffer[i];
   feedback[12] = 0x00;   // backup

@@ -17,29 +17,35 @@ void setup() {
   Serial.println("Mega SPI Master ready.");
 }
 
-void sendPacket12(const uint8_t *pkt) {
-  digitalWrite(SS_SLAVE, LOW);        // select Nano
-  for (int i = 0; i < 12; i++) {
-    SPI.transfer(pkt[i]);
+void receivePacket12(const uint8_t *pkt) {
+  digitalWrite(SS_SLAVE, LOW);  // select slave
+
+  Serial.print("Slave responded: ");
+  for (int i = 0; i < 14; i++) {
+    uint8_t response = SPI.transfer(pkt[i]); 
+    Serial.print(response, HEX);
+    Serial.print(" ");
   }
-  digitalWrite(SS_SLAVE, HIGH);       // release Nano
+  Serial.println();
+
+  digitalWrite(SS_SLAVE, HIGH);
 }
 
 void loop() {
   // Example packet: Pinky angle 45.00° => raw=4500 => LSB first
-  uint16_t pinky_raw = 4778;
+  uint16_t pinky_raw = 1500;
   uint16_t ring_raw = 4500;
   uint16_t middle_raw = 4500;
   uint16_t index_raw = 4500;
-  uint8_t pkt[12] = {
+  uint8_t pkt[14] = {
     (uint8_t)(pinky_raw & 0xFF), (uint8_t)(pinky_raw >> 8),
     (uint8_t)(ring_raw & 0xFF), (uint8_t)(ring_raw >> 8), 
     (uint8_t)(middle_raw & 0xFF), (uint8_t)(middle_raw >> 8), 
     (uint8_t)(index_raw & 0xFF), (uint8_t)(index_raw >> 8), 
-    0,0, 0,0
+    0,0, 0,0, 0,0
   };
-  sendPacket12(pkt);
 
-  Serial.println("Sent 12-byte packet.");
+  receivePacket12(pkt);
+  Serial.println("Receive 14-byte packet.");
   delay(300);
 }
