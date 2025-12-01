@@ -1,0 +1,1 @@
+/usr/bin/c++ CMakeFiles/motor_test.dir/src/main.cpp.o CMakeFiles/motor_test.dir/src/motor_control.cpp.o -o motor_test  -lpthread 
