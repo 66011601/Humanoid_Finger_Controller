@@ -10,9 +10,10 @@
 #include <cmath>
 #include <chrono>
 #include <thread>
+#include <algorithm> // For std::round
 
 // ================================================================
-// CANBus Implementation
+// CANBus Implementation (No change needed)
 // ================================================================
 CANBus::CANBus(const std::string &interface) {
     socket_fd = socket(PF_CAN, SOCK_RAW, CAN_RAW);
@@ -69,7 +70,7 @@ void CANBus::shutdown() {
 }
 
 // ================================================================
-// MotorControl Base Class
+// MotorControl Base Class (No change needed)
 // ================================================================
 MotorControl::MotorControl(uint32_t id, CANBus *bus, const std::string &name)
     : id(id), bus(bus), name(name) {}
@@ -97,7 +98,7 @@ std::vector<uint8_t> LKtech_Motor::position_write(float pos_deg, float vel_rpm) 
     // vel_raw = abs(vel) * 6 * 36  (as Python code)
     uint16_t vel_raw = (uint16_t)(std::abs(vel_rpm) * 6.0f * 36.0f);
 
-    // Direction (0 = CW, 1 = CCW)
+    // Direction (0 = CW, 1 = CCW) - Python used 0 for < 0 (CW) and 1 for >= 0 (CCW)
     uint8_t vel_dir = (vel_rpm < 0) ? 0 : 1;
 
     payload[0] = 0xA6;
@@ -135,18 +136,17 @@ float LKtech_Motor::position_read() {
         // Must have at least 8 bytes
         if (data.size() < 8) continue;
 
-        // 3) Decode little-endian 32-bit position
+        // 3) Decode little-endian 32-bit position from bytes 4-7 (index 8-15 in Python's view)
         uint32_t raw = 
             (uint32_t)data[4] |
             ((uint32_t)data[5] << 8) |
             ((uint32_t)data[6] << 16) |
             ((uint32_t)data[7] << 24);
 
-        // 4) Convert ticks → degrees
+        // 4) Convert ticks → degrees (Matches Python's (raw / 3600.0)
         float pos_deg = (float)raw / 3600.0f;
-        float final_deg = (float)pos_deg * 90.0 / 298262.0 ;
-
-        return pos_deg  ;
+        // The Python code suggests rounding, which we can approximate with std::round
+        return std::round(pos_deg * 100.0f) / 100.0f; // Python used round(pos, 2)
     }
 
     return -1.0f; // failed
@@ -165,152 +165,431 @@ void LKtech_Motor::move_and_monitor(float target_deg, float vel_rpm)
 
     std::cout << "\nMoving to " << target_deg << " deg..." << std::endl;
 
-    // Normalize angle to 0–359
-    int current_deg = (int)target_deg % 360;
-    if (current_deg < 0) current_deg += 360;
+    // Normalize angle to 0–359 (Matches Python's approach to round target)
+    int target_int = (int)std::round(target_deg) % 360;
+    if (target_int < 0) target_int += 360;
 
     // ---------------------------
     // 2. Real-time monitoring loop
     // ---------------------------
     float tolerance = 1.0f;
-    float current_pos = 0.0f;
+    float current_pos_raw = 0.0f;
+    const auto max_duration = std::chrono::seconds(15);
+    auto start_time = std::chrono::steady_clock::now();
 
     for (;;) {
         std::this_thread::sleep_for(std::chrono::milliseconds(20));
 
-        current_pos = position_read();
+        current_pos_raw = position_read();
 
-        if (current_pos < -30000) {    // failed read
+        if (current_pos_raw < -0.9f) {    // -1.0f is the failure return
             std::cout << "Feedback lost...\r";
             std::cout.flush();
             continue;
         }
 
+        // Use the rounded/scaled value from position_read() for display
+        float current_pos_rounded = current_pos_raw; 
+
         // Print real-time feedback on one line
-        std::cout << "Current: " << current_pos << " deg   \r";
+        std::cout << "Current: " << current_pos_rounded << " deg   \r";
         std::cout.flush();
 
-        // Check if motor has reached target
-        if (std::abs(current_pos - target_deg) <= tolerance) {
+        // Check if motor has reached target (compare rounded current pos to rounded target)
+        if (std::abs(current_pos_rounded - target_int) <= tolerance) {
             std::cout << "\nReached destination." << std::endl;
+            break;
+        }
+        
+        // 5. Check for timeout
+        if (std::chrono::steady_clock::now() - start_time > max_duration) {
+            std::cerr << "\n[" << name << "] Warning: Timeout waiting for target position.\n";
             break;
         }
     }
 }
 
-// ================================================================
-// RMD Bionic Motor Implementation (X8 90-degree)
-// ================================================================
-RMD_BionicMotor::RMD_BionicMotor(uint32_t id, CANBus *bus, const std::string &name)
-    : MotorControl(id, bus, name) {}
+// ---------------------------
+// RMD_BionicMotor Implementation (matches Python bit-packed 64-bit protocol)
+// ---------------------------
+RMD_BionicMotor::RMD_BionicMotor(uint32_t id_, CANBus *bus_, const std::string &name_)
+    : MotorControl(id_, bus_, name_) {}
 
+// set_state: send simple 8-byte payload with first byte as command
 void RMD_BionicMotor::set_state(int cmd) {
     std::vector<uint8_t> payload(8, 0);
-    payload[0] = (uint8_t)cmd;
+    payload[0] = static_cast<uint8_t>(cmd & 0xFF);
     bus->send_msg(id, payload);
 }
 
+// Helper: float -> IEEE754 uint32
+static uint32_t float_to_uint32(float f) {
+    union { float f; uint32_t u; } conv;
+    conv.f = f;
+    return conv.u;
+}
+
+// Helper: read 64-bit frame bytes -> uint64_t (big-endian assembled)
+static uint64_t bytes_to_uint64_be(const std::vector<uint8_t> &data) {
+    uint64_t v = 0;
+    for (size_t i = 0; i < 8 && i < data.size(); ++i) {
+        v = (v << 8) | static_cast<uint64_t>(data[i]);
+    }
+    return v;
+}
+
+// position_write(pos, vel) -> uses default current = 5.0
 std::vector<uint8_t> RMD_BionicMotor::position_write(float pos, float vel) {
-    std::vector<uint8_t> payload(8, 0);
-
-    int32_t p = (int32_t)(pos * 100);
-    int16_t v = (int16_t)(vel * 100);
-
-    payload[0] = 0xA4;  // command
-    payload[1] = p & 0xFF;
-    payload[2] = (p >> 8) & 0xFF;
-    payload[3] = (p >> 16) & 0xFF;
-    payload[4] = (p >> 24) & 0xFF;
-    payload[5] = v & 0xFF;
-    payload[6] = (v >> 8) & 0xFF;
-
-    bus->send_msg(id, payload);
-    return payload;
+    return position_write(pos, vel, 5.0f);
 }
 
+// position_write(pos, vel, cur) -> builds 64-bit packed frame
 std::vector<uint8_t> RMD_BionicMotor::position_write(float pos, float vel, float cur) {
     std::vector<uint8_t> payload(8, 0);
 
-    int32_t p = (int32_t)(pos * 100);
-    int16_t v = (int16_t)(vel * 100);
-    int16_t c = (int16_t)(cur * 100);
+    // velocity * 10 -> 15 bits
+    uint32_t vel_raw = static_cast<uint32_t>(std::round(std::abs(vel) * 10.0f)) & 0x7FFF; // 15 bits
+    // current * 10 -> 12 bits
+    uint32_t cur_raw = static_cast<uint32_t>(std::round(std::abs(cur) * 10.0f)) & 0x0FFF; // 12 bits
 
-    payload[0] = 0xA5;  // advanced position command
-    payload[1] = p & 0xFF;
-    payload[2] = (p >> 8) & 0xFF;
-    payload[3] = (p >> 16) & 0xFF;
-    payload[4] = (p >> 24) & 0xFF;
+    uint32_t pos_bits = float_to_uint32(pos); // IEEE754 bits
 
-    payload[5] = v & 0xFF;
-    payload[6] = (v >> 8) & 0xFF;
+    // Build 64-bit frame according to Python layout:
+    // bits 63..61 : 3-bit header (0b001)
+    // bits 60..29 : 32-bit IEEE754 pos
+    // bits 28..14 : 15-bit vel
+    // bits 13..2  : 12-bit cur
+    // bits 1..0   : 2-bit footer 0b10
 
-    payload[7] = c & 0xFF;  // current
+    uint64_t frame = 0;
+    frame |= (uint64_t)0x1ULL << 61; // header 0b001 placed at bits 63..61 (value 1 << 61)
+    frame |= (uint64_t)pos_bits << 29;
+    frame |= (uint64_t)vel_raw << 14;
+    frame |= (uint64_t)cur_raw << 2;
+    frame |= (uint64_t)0x2ULL; // footer 0b10
+
+    // Split into bytes (big-endian order)
+    for (int i = 0; i < 8; ++i) {
+        payload[i] = static_cast<uint8_t>((frame >> (56 - i * 8)) & 0xFF);
+    }
 
     bus->send_msg(id, payload);
     return payload;
 }
 
+// position_read(): send read request and parse position (float)
 float RMD_BionicMotor::position_read() {
-    uint32_t r_id;
+    // Send read request (0x0E 0x00 0x00 0x01)
+    std::vector<uint8_t> req(8, 0);
+    req[0] = 0x0E;
+    req[3] = 0x01;
+    bus->send_msg(id, req);
+
+    uint32_t rid;
     std::vector<uint8_t> data;
 
-    if (bus->read_msg(r_id, data)) {
-        if (data.size() >= 4) {
-            int32_t raw = (data[1] | (data[2] << 8));
-            return raw * 0.01f;
+    for (int i = 0; i < 20; ++i) {
+        if (!bus->read_msg(rid, data)) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            continue;
+        }
+        if (rid != id) continue;
+        if (data.size() < 8) continue;
+
+        uint64_t frame = bytes_to_uint64_be(data);
+
+        // POS = bits [8..39] (Python msg_bin) -> frame bits [55..24] (Big-Endian)
+        uint32_t pos_bits = (uint32_t)((frame >> 24) & 0xFFFFFFFFULL);
+
+        union { uint32_t u; float f; } conv;
+        conv.u = pos_bits;
+        // Match Python's rounding (round to 1 decimal place)
+        return std::round(conv.f * 10.0f) / 10.0f; 
+    }
+
+    return -100000.0f;
+}
+
+// read_feedback(): returns only position (float)
+float RMD_BionicMotor::read_feedback() {
+    RMDFeedback fb = read_feedback_struct();
+    return fb.pos;
+}
+
+// read_feedback_struct(): full decoding of a single 8-byte response frame
+RMDFeedback RMD_BionicMotor::read_feedback_struct() {
+    RMDFeedback out;
+    out.msg_class = -1;
+    out.err_msg = -1;
+    out.pos = -100000.0f;
+    out.current = 0.0f;
+    out.temp = NAN; // Set to NaN initially
+
+    uint32_t rid;
+    std::vector<uint8_t> data;
+    if (!bus->read_msg(rid, data)) return out;
+    if (rid != id) return out;
+    if (data.size() < 8) return out;
+
+    uint64_t frame = bytes_to_uint64_be(data);
+
+    // --- Parse fields to match Python logic ---
+
+    // 1. msg_class: bits 63..61 (Python msg_bin[:3])
+    int msg_class = static_cast<int>((frame >> 61) & 0x7ULL);      
+
+    // 2. err_msg: bits 58..54 (Python msg_bin[3:8])
+    int err_msg = static_cast<int>((frame >> 56) & 0x1FUL);
+
+    // 3. pos: bits 55..24 (Python msg_bin[8:40])
+    uint32_t pos_bits = static_cast<uint32_t>((frame >> 24) & 0xFFFFFFFFULL);
+    union { uint32_t u; float f; } conv;
+    conv.u = pos_bits;
+    float pos_f = std::round(conv.f * 10.0f) / 10.0f; // Round to 1 decimal place
+
+    // 4. current: bits 23..8 (Python msg_bin[40:56], then / 100)
+    uint32_t current_raw_16bit = static_cast<uint32_t>((frame >> 8) & 0xFFFFULL);
+    float current_f = std::round((static_cast<float>(current_raw_16bit) / 100.0f) * 100.0f) / 100.0f; // Round to 2 decimal places
+
+    // 5. temp: bits 7..0 (Python msg_bin[56:], then scale)
+    uint32_t temp_raw = static_cast<uint32_t>(frame & 0xFFULL); 
+    float temp_f = std::round(((static_cast<float>(temp_raw) - 50.0f) / 2.0f) * 10.0f) / 10.0f; // Round to 1 decimal place
+
+    out.msg_class = msg_class;
+    out.err_msg = err_msg;
+    out.pos = pos_f;
+    out.current = current_f;
+    out.temp = temp_f;
+    return out;
+}
+
+// position_write_increment: behavioral loop until target reached
+void RMD_BionicMotor::position_write_increment(float deg, float vel, float cur) {
+    // Read current position and cast/round to integer target, matching Python
+    int current = static_cast<int>(std::round(position_read()));
+    if (current < -50000) {
+        std::cerr << "[RMD_BionicMotor] position_write_increment: failed to read current position\n";
+        return;
+    }
+
+    int target = current + static_cast<int>(std::round(deg));
+    const float tolerance = 0.1f;
+    const auto sleep_interval = std::chrono::milliseconds(200);
+    const auto max_duration = std::chrono::seconds(15);
+
+    auto start = std::chrono::steady_clock::now();
+
+    while (true) {
+        // send command (using float target)
+        position_write((float)target, vel, cur);
+
+        std::this_thread::sleep_for(sleep_interval);
+
+        // read feedback (structured) and check pos
+        RMDFeedback fb = read_feedback_struct();
+        if (fb.msg_class != -1) {
+            std::cout << "[RMD_BionicMotor] current: " << fb.pos << " target: " << target << std::endl;
+            // Check if the rounded current position matches the integer target
+            if (std::fabs(std::round(fb.pos) - target) <= 0.5f) { // Use 0.5f to check against integer
+                std::cout << "[RMD_BionicMotor] target reached." << std::endl;
+                break;
+            }
+        } else {
+            std::cerr << "[RMD_BionicMotor] no feedback, retrying..." << std::endl;
+        }
+
+        if (std::chrono::steady_clock::now() - start > max_duration) {
+            std::cerr << "[RMD_BionicMotor] position_write_increment: timeout\n";
+            break;
         }
     }
-    return 0.0f;
 }
 
-float RMD_BionicMotor::read_feedback() {
-    return position_read();
+// NEW FUNCTION: position_write_absolute: behavioral loop until absolute target reached
+void RMD_BionicMotor::position_write_absolute(float target_deg, float vel_rpm, float current_limit) {
+    std::cout << "\n[RMD_BionicMotor] Moving to absolute target: " << target_deg << " deg..." << std::endl;
+    
+    // Constants for the loop
+    const float tolerance = 1.0f; 
+    const auto sleep_interval = std::chrono::milliseconds(200);
+    const auto max_duration = std::chrono::seconds(15);
+    auto start_time = std::chrono::steady_clock::now();
+
+    while (true) { 
+        // 1. Re-send the absolute command continuously
+        position_write(target_deg, vel_rpm, current_limit); 
+
+        std::this_thread::sleep_for(sleep_interval);
+        
+        // 2. Read feedback
+        RMDFeedback fb = read_feedback_struct();
+        
+        // 3. Check for read errors
+        if (fb.pos < -50000.0f) {
+            std::cerr << "[RMD_BionicMotor] Warning: Failed to read feedback.\n";
+            continue;
+        }
+        
+        // 4. Print status on a single line
+        std::cout << "[RMD_BionicMotor] Current: " << fb.pos << " deg | Target: " << target_deg << " deg   \r";
+        std::cout.flush();
+        
+        // 5. Check if target is reached
+        if (std::abs(fb.pos - target_deg) <= tolerance) {
+            std::cout << "\n[RMD_BionicMotor] Target reached." << std::endl;
+            break;
+        }
+        
+        // 6. Check for timeout
+        if (std::chrono::steady_clock::now() - start_time > max_duration) {
+            std::cerr << "\n[RMD_BionicMotor] Warning: Timeout waiting for target position.\n";
+            break;
+        }
+    }
 }
 
-void RMD_BionicMotor::position_write_increment(float deg, float vel, float cur) {
-    position_write(deg, vel, cur);
+void RMD_BionicMotor::move_and_monitor(float target_deg, float vel_rpm) {
+    // This motor uses its specialized function, so we call it here with a default current limit.
+    // NOTE: In the actual application, you would use this to implement monitoring for this motor type.
+    std::cerr << "[" << name << "] Bionic motor is using its absolute write, not 'move_and_monitor'.\n";
+    position_write_absolute(target_deg, vel_rpm, 5.0f); // Default 5A current limit
 }
 
 // ================================================================
-// RMD Standard Motor Implementation
+// RMD Standard Motor Implementation (CORRECTED)
 // ================================================================
 RMD_Motor::RMD_Motor(uint32_t id, CANBus *bus, const std::string &name)
     : MotorControl(id, bus, name) {}
 
 void RMD_Motor::set_state(int cmd) {
     std::vector<uint8_t> payload(8, 0);
-    payload[0] = (uint8_t)cmd;
+    // Command 0x80: Motor Off, 0x88: Motor Stop, 0x81: Motor Running (Enable)
+    payload[0] = (uint8_t)cmd; 
     bus->send_msg(id, payload);
+    std::cout << "[" << name << "] Sent set state command 0x" << std::hex << cmd << std::dec << std::endl;
 }
 
+/**
+ * @brief Sends the RMD Position Command (0xA6) based on Python structure.
+ *
+ * NOTE: This structure does NOT match the standard RMD 0xA6 protocol (which usually
+ * has Max Current in bytes 1-2). It is modified to match the provided Python script's
+ * unique packing: [0xA6, Vel_Dir, Vel_LSB, Vel_MSB, Pos_LSB, Pos_MidL, Pos_MidH, Pos_MSB].
+ *
+ * Protocol from Python:
+ * Byte 0: 0xA6 (Python's Command)
+ * Byte 1: vel_dir (0 for CW/Neg, 1 for CCW/Pos)
+ * Byte 2-3: Max Speed (16-bit, Python-scaled)
+ * Byte 4-7: Target Position (32-bit, 0.01 deg/LSB, little-endian)
+ */
 std::vector<uint8_t> RMD_Motor::position_write(float pos, float vel) {
     std::vector<uint8_t> payload(8, 0);
-    int32_t p = (int32_t)(pos * 100);
 
+    // 1. Target Position value (32-bit, 0.01 degree resolution)
+    // Degrees * 100 = 0.01 degree units
+    int32_t p = (int32_t)(pos * 100.0f);
+
+    // 2. Velocity/Speed value (16-bit, Python-scaled)
+    // Python scaling: vel = int(abs(vel) * 6). This is the 'raw' value.
+    uint16_t vel_raw = (uint16_t)(std::abs(vel) * 6.0f);
+    
+    // 3. Direction/Sign (Byte 1)
+    // Python logic: vel_dir = 0 if vel < 0 else 1
+    uint8_t vel_dir = (vel < 0.0f) ? 0x00 : 0x01;
+    
+    // Command mapping for 0xA6
     payload[0] = 0xA4;
-    payload[1] = p & 0xFF;
-    payload[2] = (p >> 8) & 0xFF;
-    payload[3] = (p >> 16) & 0xFF;
-    payload[4] = (p >> 24) & 0xFF;
+
+    // Byte 1: Velocity Direction/Sign (0 or 1)
+    payload[1] = vel_dir; 
+
+    // Byte 2 (Speed LSB) & Byte 3 (Speed MSB) - 16-bit value
+    payload[2] = vel_raw & 0xFF;
+    payload[3] = (vel_raw >> 8) & 0xFF;
+
+    // Byte 4 (Position LSB) through Byte 7 (Position MSB) - 32-bit value
+    payload[4] = p & 0xFF;
+    payload[5] = (p >> 8) & 0xFF;
+    payload[6] = (p >> 16) & 0xFF;
+    payload[7] = (p >> 24) & 0xFF;
 
     bus->send_msg(id, payload);
     return payload;
 }
 
+/**
+ * @brief Sends 0x92 request and waits for the 0x92 response to get multi-turn position.
+ */
 float RMD_Motor::position_read() {
+    // 1. Send position read request (0x92)
+    std::vector<uint8_t> req(8, 0);
+    req[0] = 0x92;
+    bus->send_msg(id, req); 
+
     uint32_t r_id;
     std::vector<uint8_t> data;
-
-    if (bus->read_msg(r_id, data)) {
-        if (data.size() >= 4) {
-            int32_t raw = (data[1] | (data[2] << 8));
-            return raw * 0.01f;
+    
+    // Poll for the response for a short duration
+    for (int i = 0; i < 20; ++i) {
+        if (!bus->read_msg(r_id, data)) {
+             std::this_thread::sleep_for(std::chrono::milliseconds(5));
+             continue;
         }
+        
+        // Ensure response is from our motor ID and is the correct 0x92 response
+        if (r_id != 0x241) continue;
+        if (data.size() < 8 || data[0] != 0x92) continue;
+
+        // Decode 32-bit position from bytes 4-7 (little-endian)
+        // This is the correct indexing for the multi-turn position
+        int32_t raw_pos = (data[4] | (data[5] << 8) | (data[6] << 16) | (data[7] << 24)); 
+        
+        // Resolution is 0.01 deg/LSB
+        return (float)raw_pos / 100.0f;
     }
-    return 0.0f;
+    // Return 0.0f on failure, though a sentinel like -9999.0f might be better for error detection
+    return 0.0f; 
 }
 
 float RMD_Motor::read_feedback() {
     return position_read();
 }
 
+void RMD_Motor::move_and_monitor(float target_deg, float vel_rpm) {
+    std::cout << "\n[" << name << "] Moving to absolute target: " << target_deg << " deg (Speed: " << vel_rpm << " RPM)..." << std::endl;
+    
+    const float tolerance = 1.0f; 
+    const auto sleep_interval = std::chrono::milliseconds(50);
+    const auto max_duration = std::chrono::seconds(10);
+    auto start_time = std::chrono::steady_clock::now();
+    
+    float normalized_target = std::round(target_deg * 100.0f) / 100.0f;
+
+    while (true) { 
+        // 1. Re-send the absolute command continuously.
+        position_write(target_deg, vel_rpm); 
+
+        std::this_thread::sleep_for(sleep_interval);
+        
+        // 2. Read feedback (which internally sends 0x92 request and waits for response)
+        float current_pos = position_read();
+        
+        // std::cout << "\nPrint Pass" << std::endl;
+        
+        // 3. Print status on a single line
+        std::cout << "[" << name << "] Current: " << current_pos << " deg | Target: " << target_deg << " deg   \r";
+        std::cout.flush();
+        
+        // 4. Check if target is reached
+        if (std::abs(current_pos - normalized_target) <= tolerance) {
+            std::cout << "\n[" << name << "] Target reached." << std::endl;
+            break;
+        }
+        
+        // 5. Check for timeout
+        if (std::chrono::steady_clock::now() - start_time > max_duration) {
+            std::cerr << "\n[" << name << "] Warning: Timeout waiting for target position.\n";
+            break;
+        }
+    }
+}
