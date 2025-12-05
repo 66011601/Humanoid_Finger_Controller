@@ -16,6 +16,17 @@ private:
     int socket_fd;
 };
 
+// ---------------------------
+// Helper struct for RMD feedback
+// ---------------------------
+struct RMDFeedback {
+    int msg_class;
+    int err_msg;
+    float pos;      // degrees
+    float current;  // amps
+    float temp;     // degrees C
+};
+
 // ==========================
 // Base Abstract Motor Class
 // ==========================
@@ -27,6 +38,8 @@ public:
     virtual std::vector<uint8_t> position_write(float pos, float vel) = 0;
     virtual float position_read() = 0;
     virtual float read_feedback() = 0;
+    
+    virtual void move_and_monitor(float target_deg, float vel_rpm) = 0;
 
 protected:
     uint32_t id;
@@ -64,11 +77,17 @@ public:
 
     float position_read() override;
     float read_feedback() override;
+    RMDFeedback read_feedback_struct(); // full feedback struct
 
     // Missing override (fix)
     void set_state(int cmd) override;
 
     void position_write_increment(float deg, float vel = 20, float cur = 5);
+    
+    // NEW: Function to move to an absolute position and monitor progress
+    void position_write_absolute(float target_deg, float vel_rpm, float current_limit);
+    
+    void move_and_monitor(float target_deg, float vel_rpm) override;
 };
 
 // ==========================
@@ -82,5 +101,6 @@ public:
     std::vector<uint8_t> position_write(float pos, float vel) override;
     float position_read() override;
     float read_feedback() override;
+    
+    void move_and_monitor(float target_deg, float vel_rpm);
 };
-
