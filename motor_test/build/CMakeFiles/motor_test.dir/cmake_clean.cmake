@@ -1,4 +1,6 @@
 file(REMOVE_RECURSE
+  "CMakeFiles/motor_test.dir/src/can_bus.cpp.o"
+  "CMakeFiles/motor_test.dir/src/can_bus.cpp.o.d"
   "CMakeFiles/motor_test.dir/src/main.cpp.o"
   "CMakeFiles/motor_test.dir/src/main.cpp.o.d"
   "CMakeFiles/motor_test.dir/src/motor_control.cpp.o"

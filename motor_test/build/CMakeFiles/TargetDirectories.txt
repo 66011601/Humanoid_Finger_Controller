@@ -1,3 +1,3 @@
-/home/thana/humanoid/cpp_ws/motor_test/build/CMakeFiles/motor_test.dir
-/home/thana/humanoid/cpp_ws/motor_test/build/CMakeFiles/edit_cache.dir
-/home/thana/humanoid/cpp_ws/motor_test/build/CMakeFiles/rebuild_cache.dir
+/home/thana/Humanoid/cpp_ws/motor_test/build/CMakeFiles/motor_test.dir
+/home/thana/Humanoid/cpp_ws/motor_test/build/CMakeFiles/edit_cache.dir
+/home/thana/Humanoid/cpp_ws/motor_test/build/CMakeFiles/rebuild_cache.dir

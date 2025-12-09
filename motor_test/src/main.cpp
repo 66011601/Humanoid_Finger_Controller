@@ -4,6 +4,7 @@
 #include <cmath>
 #include <memory> // For std::unique_ptr
 #include "motor_control.hpp"
+#include "can_bus.hpp"
 
 // Define placeholder CAN IDs (Please check these IDs for your specific setup)
 constexpr uint32_t LKTECH_CAN_ID = 0x141; // Common ID for LKtech motors
